@@ -21,7 +21,7 @@ impl Readable for u8 {
     }
 }
 
-macro_rules! readable_number {
+macro_rules! readable_unsigned_int {
     ($t:ty) => {
         impl Readable for $t {
             fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
@@ -31,17 +31,40 @@ macro_rules! readable_number {
     };
 }
 
-readable_number!(u32);
-readable_number!(i32);
-readable_number!(i64);
-readable_number!(f32);
-readable_number!(f64);
-readable_number!(usize);
+macro_rules! readable_signed_int {
+    ($t:ty) => {
+        impl Readable for $t {
+            fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
+                Ok(leb128::read::signed(input)? as Self)
+            }
+        }
+    };
+}
+
+readable_unsigned_int!(usize);
+readable_unsigned_int!(u32);
+readable_signed_int!(i32);
+readable_unsigned_int!(u64);
+readable_signed_int!(i64);
+
+impl Readable for f32 {
+    fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
+        use byteorder::{ReadBytesExt, LittleEndian};
+        Ok(input.read_f32::<LittleEndian>()?)
+    }
+}
+
+impl Readable for f64 {
+    fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
+        use byteorder::{ReadBytesExt, LittleEndian};
+        Ok(input.read_f64::<LittleEndian>()?)
+    }
+}
 
 impl<T: Readable> Readable for Vec<T> {
     fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Vec<T>, Box<dyn Error>> {
         let mut result = Vec::new();
-        let length = usize::read_from(input)?;
+        let length = u32::read_from(input)?;
         for _ in 0..length {
             result.push(T::read_from(input)?);
         }
@@ -146,50 +169,159 @@ impl Readable for Memory {
     }
 }
 
+#[derive(Debug)]
+pub struct Memarg {
+    pub align: u32,
+    pub offset: u32,
+}
+
+impl Readable for Memarg {
+    fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
+        Ok(Memarg {
+            align: u32::read_from(input)?,
+            offset: u32::read_from(input)?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct Block {
+    pub blocktype: i64, // TODO blocktype
+    pub expr: Expression,
+}
+
+impl Readable for Block {
+    fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
+        let blocktype = i64::read_from(input)?;
+        let expr = Expression::read_from(input)?;
+        Ok(Block { blocktype, expr })
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug)]
 pub enum Instruction {
+    // Control Instructions
     Unreachable                          = 0x00,
     Nop                                  = 0x01,
-    Block(Expression)                    = 0x02,
-    Loop(Expression)                     = 0x03,
-    If((Expression, Option<Expression>)) = 0x04,
+    Block(Block)                         = 0x02,
+    Loop(Block)                          = 0x03,
+    If((Block, Option<Expression>))      = 0x04,
     Branch(Idx)                          = 0x0C,
     BranchIf(Idx)                        = 0x0D,
     BranchTable((Vec<Idx>, Idx))         = 0x0E,
     Return                               = 0x0F,
     Call(Idx)                            = 0x10,
-    CallIndirecto((Idx, Idx))            = 0x11,
+    CallIndirect((Idx, Idx))             = 0x11,
 
+    // Parametric Instructions
+    Drop                                 = 0x1A,
+    Select                               = 0x1B,
+    SelectT(Vec<ValType>)                = 0x1C,
 
+    // Variable Instructions
+    LocalGet(Idx)                        = 0x20,
+    LocalSet(Idx)                        = 0x21,
+    LocalTee(Idx)                        = 0x22,
+    GlobalGet(Idx)                       = 0x23,
+    GlobalSet(Idx)                       = 0x24,
+
+    // Memory Instructions
+    Memarg(Memarg),
+    MemorySize                           = 0x3F,
+    MemoryGrow                           = 0x40,
+
+    // Numeric Instructions
     ConstI32(i32)                        = 0x41,
     ConstI64(i64)                        = 0x42,
     ConstF32(f32)                        = 0x43,
     ConstF64(f64)                        = 0x44,
+    Numeric(u8),  // TODO Placeholder for all numeric plain opcodes with no immediates
+    Truncate(u8)                         = 0xFC,
 
     Unknown(u8),
 }
 
 #[derive(Debug)]
-pub struct Expression<const T: u8 = 0x0B> {
+pub struct Expression {
     pub instructions: Vec<Instruction>,
+    pub terminator: u8,
 }
 
-impl<const T: u8> Readable for Expression<T> {
+impl Readable for Expression {
     fn read_from<R: BufRead + Read>(input: &mut R) -> Result<Self, Box<dyn Error>> {
         let mut instructions = vec![];
+        let mut opcode;
         loop {
-            let opcode = u8::read_from(input)?;
-            match opcode {
-                _ if opcode == T => break,
-                0x41 => instructions.push(Instruction::ConstI32(i32::read_from(input)?)),
-                0x42 => instructions.push(Instruction::ConstI64(i64::read_from(input)?)),
-                0x43 => instructions.push(Instruction::ConstF32(f32::read_from(input)?)),
-                0x44 => instructions.push(Instruction::ConstF64(f64::read_from(input)?)),
-                unknown => instructions.push(Instruction::Unknown(unknown)),
-            }
+            opcode = u8::read_from(input).expect("opcode");
+            let instruction = match opcode {
+                // Termination opcode
+                _ if opcode == 0x0B || opcode == 0x05 => break,
+                // Control Instructions
+                0x00 => Instruction::Unreachable,
+                0x01 => Instruction::Nop,
+                0x02 => {
+                    let block = Block::read_from(input)?;
+                    Instruction::Block(block)
+                },
+                0x03 => {
+                    let expr = Block::read_from(input)?;
+                    Instruction::Loop(expr)
+                },
+                0x04 => {
+                    let ifbranch = Block::read_from(input)?;
+                    let elsebranch = if ifbranch.expr.terminator == 0x05 {
+                        Some(Expression::read_from(input)?)
+                    } else {
+                        None
+                    };
+                    Instruction::If((ifbranch, elsebranch))
+                },
+                0x0C => Instruction::Branch(Idx::read_from(input)?),
+                0x0D => Instruction::BranchIf(Idx::read_from(input)?),
+                0x0E => Instruction::BranchTable((<Vec<Idx>>::read_from(input)?, Idx::read_from(input)?)),
+                0x0F => Instruction::Return,
+                0x10 => Instruction::Call(Idx::read_from(input)?),
+                0x11 => Instruction::CallIndirect((Idx::read_from(input)?, Idx::read_from(input)?)),
+
+                // Parametric Instructions
+                0x1A => Instruction::Drop,
+                0x1B => Instruction::Select,
+                0x1C => Instruction::SelectT(<Vec<ValType>>::read_from(input)?),
+
+                // Variable Instructions
+                0x20 => Instruction::LocalGet(Idx::read_from(input)?),
+                0x21 => Instruction::LocalSet(Idx::read_from(input)?),
+                0x22 => Instruction::LocalTee(Idx::read_from(input)?),
+                0x23 => Instruction::GlobalGet(Idx::read_from(input)?),
+                0x24 => Instruction::GlobalSet(Idx::read_from(input)?),
+
+                // Memory argument
+                // TODO
+                0x28..=0x3E => Instruction::Memarg(Memarg::read_from(input)?),
+                0x3F => {
+                    assert_eq!(u8::read_from(input)?, 0x0);
+                    Instruction::MemorySize
+                },
+                0x40 => {
+                    assert_eq!(u8::read_from(input)?, 0x0);
+                    Instruction::MemoryGrow
+                },
+
+                // Numeric Instructions
+                0x41 => Instruction::ConstI32(i32::read_from(input)?),
+                0x42 => Instruction::ConstI64(i64::read_from(input)?),
+                0x43 => Instruction::ConstF32(f32::read_from(input)?),
+                0x44 => Instruction::ConstF64(f64::read_from(input)?),
+                // TODO
+                0x45..=0xC4 => Instruction::Numeric(opcode),
+                0xFC => Instruction::Truncate(u8::read_from(input)?),
+
+                unknown => panic!("Unknown opcode {:#x}", unknown),
+            };
+            instructions.push(instruction);
         }
-        Ok(Expression { instructions })
+        Ok(Expression { instructions, terminator: opcode })
     }
 }
 
